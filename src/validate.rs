@@ -246,6 +246,7 @@ impl Policy {
                     self.check_query_limit(query)?;
                     self.check_query_offsets(query)?;
                     self.check_bounded_nested_work(query)?;
+                    self.check_projection_set_returning(query)?;
                     self.detect_cartesian_products(query)?;
                 }
                 Statement::Explain { statement, analyze, options, .. } => {
@@ -286,6 +287,7 @@ impl Policy {
                     self.check_query_limit(query)?;
                     self.check_query_offsets(query)?;
                     self.check_bounded_nested_work(query)?;
+                    self.check_projection_set_returning(query)?;
                     self.detect_cartesian_products(query)?;
                 }
                 Statement::Insert(_) => {
@@ -384,6 +386,27 @@ impl Policy {
         let tokens = Tokenizer::new(&dialect, sql)
             .tokenize()
             .map_err(|e| format!("Failed to tokenize SQL for contract checks: {e}"))?;
+
+        // Unicode-escape identifiers (`U&"..."`) and strings (`U&'...'`) let the
+        // escaped bytes name a function or catalog object that never matches a
+        // blocklist entry: `U&"v\0065rsion"()` reaches the server as `version()`.
+        // The introducer is a bare `u`/`U` word glued — no whitespace token
+        // between — to `&` glued to a quoted string. Scan the UNFILTERED stream
+        // so the adjacency is real; `u & "x"` (spaced) is ordinary bitwise-and
+        // and must survive. Reject the form outright: it has no legitimate use
+        // on this surface, and admitting it would mean decoding every escape.
+        for window in tokens.windows(3) {
+            let [Token::Word(intro), Token::Ampersand, third] = window else {
+                continue;
+            };
+            let is_introducer = intro.quote_style.is_none() && intro.value.eq_ignore_ascii_case("u");
+            let third_is_quoted = matches!(third, Token::Word(w) if w.quote_style.is_some())
+                || matches!(third, Token::SingleQuotedString(_) | Token::DoubleQuotedString(_));
+            if is_introducer && third_is_quoted {
+                return Err("Unicode-escaped identifiers and strings (U&\"…\") are not allowed on this SQL surface.".to_string());
+            }
+        }
+
         let meaningful: Vec<&Token> = tokens.iter().filter(|token| !matches!(token, Token::Whitespace(_))).collect();
 
         for (idx, token) in meaningful.iter().enumerate() {
@@ -737,22 +760,49 @@ impl Policy {
         self.set_returning_functions.iter().any(|f| f == &rendered)
     }
 
+    /// A set-returning function in a SELECT list expands one input row into many
+    /// output rows before any outer LIMIT or aggregate applies. In a derived
+    /// table — `SELECT count(*) FROM (SELECT generate_series(1, 1e9) AS g) t` —
+    /// the inner explosion happens even though the outer query looks bounded.
+    /// SRFs are already refused as FROM relations; refuse them in projections
+    /// too, at every nesting level the visitor reaches.
+    fn check_projection_set_returning(&self, query: &Query) -> Result<(), String> {
+        check_each_query(query, |q| {
+            let SetExpr::Select(select) = q.body.as_ref() else {
+                return Ok(());
+            };
+            for item in &select.projection {
+                let expr = match item {
+                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+                    _ => continue,
+                };
+                if self.expression_contains_set_returning_function(expr) {
+                    return Err(
+                        "Set-returning functions are not allowed in the SELECT list on this SQL \
+                         surface; they can expand result cardinality without bound."
+                            .to_string(),
+                    );
+                }
+            }
+            Ok(())
+        })
+    }
+
     // § cartesian products and tautological joins
 
     fn detect_cartesian_products(&self, query: &Query) -> Result<(), String> {
-        // Check CTEs for cartesian products.
-        if let Some(with) = &query.with {
-            for cte in &with.cte_tables {
-                self.detect_cartesian_products(&cte.query)?;
-            }
-        }
-        self.detect_cartesian_in_set_expr(&query.body)
+        // `check_each_query` visits every Query node in the tree — CTEs, derived
+        // tables, set-operation branches, AND expression subqueries such as
+        // `WHERE id IN (SELECT a.id FROM a CROSS JOIN b)`, which a FROM-only
+        // recursion never reaches. Each Query's own FROM/join shape is checked
+        // once here; nesting is handled by the visitor, not by re-descending.
+        check_each_query(query, |q| self.detect_cartesian_in_set_expr(&q.body))
     }
 
     fn detect_cartesian_in_set_expr(&self, expr: &SetExpr) -> Result<(), String> {
         match expr {
             SetExpr::Select(select) => self.detect_cartesian_in_select(select),
-            SetExpr::Query(query) => self.detect_cartesian_products(query),
+            // Nested queries are reached by the visitor as their own nodes.
             SetExpr::SetOperation { left, right, .. } => {
                 self.detect_cartesian_in_set_expr(left)?;
                 self.detect_cartesian_in_set_expr(right)
@@ -763,7 +813,9 @@ impl Policy {
 
     fn detect_cartesian_in_select(&self, select: &Select) -> Result<(), String> {
         for table_with_joins in &select.from {
-            // Recurse into subqueries in FROM clause.
+            // A NestedJoin hides its joins inside the relation rather than as a
+            // separate Query node, so its shape is still walked here; ordinary
+            // derived tables are reached by the visitor.
             self.detect_cartesian_in_table_factor(&table_with_joins.relation)?;
             for join in &table_with_joins.joins {
                 self.detect_cartesian_in_table_factor(&join.relation)?;
@@ -816,7 +868,8 @@ impl Policy {
 
     fn detect_cartesian_in_table_factor(&self, factor: &TableFactor) -> Result<(), String> {
         match factor {
-            TableFactor::Derived { subquery, .. } => self.detect_cartesian_products(subquery),
+            // A Derived subquery is its own Query node; the visitor reaches it.
+            // Only NestedJoin hides join shapes that are not separate nodes.
             TableFactor::NestedJoin { table_with_joins, .. } => {
                 self.detect_cartesian_in_table_factor(&table_with_joins.relation)?;
                 for join in &table_with_joins.joins {
@@ -1263,10 +1316,16 @@ fn is_tautological_join_expr(expr: &Expr) -> bool {
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => is_tautological_join_expr(left) && is_tautological_join_expr(right),
             BinaryOperator::Or => is_tautological_join_expr(left) || is_tautological_join_expr(right),
-            BinaryOperator::Eq => match (literal_expr_fingerprint(left), literal_expr_fingerprint(right)) {
-                (Some(lhs), Some(rhs)) => lhs == rhs,
-                _ => false,
-            },
+            // `a.id = a.id` (any expression equal to itself) constrains nothing:
+            // every row pair satisfies it, so the join is still a cartesian
+            // product. Also catch equal literals like `1 = 1`.
+            BinaryOperator::Eq => {
+                left == right
+                    || matches!(
+                        (literal_expr_fingerprint(left), literal_expr_fingerprint(right)),
+                        (Some(lhs), Some(rhs)) if lhs == rhs
+                    )
+            }
             _ => false,
         },
         _ => false,

@@ -2,7 +2,7 @@
 //!
 //! Runs inside the query's transaction, in order: role first, then the
 //! resource clamps that keep one query from owning the box, then row-level
-//! security context, then `default_transaction_read_only = on` — the second,
+//! security context, then `transaction_read_only = on` — the second,
 //! independent write-protection layer under the AST gate. A single validator
 //! gap can no longer turn an accidental write grant into a real mutation.
 
@@ -210,8 +210,8 @@ pub struct SessionOptions {
     pub disable_parallelism: bool,
     /// `jit = off`: JIT compilation is a cost amplifier on adversarial plans.
     pub disable_jit: bool,
-    /// `default_transaction_read_only = on`, the independent write-protection
-    /// layer. Leave on unless the session must write.
+    /// `transaction_read_only = on`, the independent write-protection layer.
+    /// Leave on unless the session must write.
     pub read_only: bool,
 }
 
@@ -265,7 +265,12 @@ pub fn build_setup_statements(
         setup.extend(rls.set_local_statements());
     }
     if options.read_only {
-        setup.push("SET LOCAL default_transaction_read_only = on".to_string());
+        // `transaction_read_only`, not `default_transaction_read_only`: the
+        // `default_` GUC only seeds transactions that START after it is set, so
+        // setting it mid-transaction (where this battery runs) is a no-op. The
+        // plain form is the current transaction's own read-only flag — the same
+        // thing `SET TRANSACTION READ ONLY` sets — and takes effect immediately.
+        setup.push("SET LOCAL transaction_read_only = on".to_string());
     }
     Ok(setup)
 }
@@ -316,7 +321,7 @@ mod tests {
         assert!(setup.contains(&format!("SET LOCAL app.user_groups = '{},{}'", groups[0], groups[1])));
         assert!(setup.contains(&"SET LOCAL app.access_mode = 'full'".to_string()));
         // Second write-protection layer under the AST gate, last.
-        assert_eq!(setup.last().unwrap(), "SET LOCAL default_transaction_read_only = on");
+        assert_eq!(setup.last().unwrap(), "SET LOCAL transaction_read_only = on");
     }
 
     #[test]
