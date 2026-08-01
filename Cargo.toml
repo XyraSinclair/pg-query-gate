@@ -1,0 +1,11 @@
+[package]
+name = "pg-query-gate"
+version = "0.1.0"
+edition = "2021"
+description = "Deny-by-default validation and session hardening for serving untrusted SQL on PostgreSQL."
+license-file = "LICENSE.md"
+
+[dependencies]
+sqlparser = { version = "0.52", features = ["visitor"] }
+blake3 = "1"
+uuid = "1"

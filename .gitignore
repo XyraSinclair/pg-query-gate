@@ -1,0 +1,6 @@
+/target
+/extract_*
+Cargo.lock
+
+# Internal only — the give/withhold analysis, never published.
+IP-MANIFEST.md
