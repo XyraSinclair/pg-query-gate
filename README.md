@@ -27,23 +27,37 @@ gap in any one leaves the others standing.
    cartesian-product and tautological-join detection, and EXPLAIN ANALYZE
    refusal.
 2. **Token gate** (also in `Policy::validate`). An independent screen at the
-   token level: blocked schema qualifiers, blocked identifiers and prefixes
-   (`pg_*`, `dblink*`, `lo_*`, advisory locks, sequence movers, XML
-   exfiltration helpers, …), applied equally to double-quoted identifier
-   forms so `"pg_catalog"."pg_class"` cannot bypass the bare-word list.
+   token level: blocked schema qualifiers, blocked prefixes (`pg_*`,
+   `binary_upgrade_*`), and blocked identifiers by name (`dblink_*` and `lo_*`
+   functions, advisory locks, sequence movers, XML exfiltration helpers, …).
+   It applies equally to quoted identifiers so `"pg_catalog"."pg_class"`
+   cannot bypass the bare-word list, and refuses the Unicode-escape identifier
+   form (`U&"..."`) outright so escaped bytes cannot smuggle a blocked name.
 3. **Session battery** (`session::build_setup_statements`). The `SET LOCAL`
    preamble before every query: role switch, pinned `search_path`
    (`pg_catalog` first), statement and lock timeouts, `work_mem` cap,
    parallelism off, JIT off, `temp_file_limit`, the row-level-security
-   context trio (all three vars or none), and
-   `default_transaction_read_only = on` — so a validator gap still cannot
-   turn an accidental write grant into a mutation.
+   context trio (all three vars or none), and `transaction_read_only = on` —
+   so a validator gap still cannot turn an accidental write grant into a
+   mutation. The battery runs inside the query's transaction and must run on
+   every query; it is the layer that carries the per-query clamps.
 4. **Role DDL** (`sql/hardening.sql`). The database-side floor: a NOLOGIN
-   minimally-privileged serving role with role-level timeout backstops,
-   `REVOKE CREATE ON SCHEMA public`, and function-execution revocations for
-   existing and future objects.
+   minimally-privileged serving role, `REVOKE CREATE ON SCHEMA public`, and
+   function-execution revocations for existing and future objects in the
+   served schema. It backstops the served schema, not `pg_catalog`, so the
+   token and AST gates remain the primary control for catalog functions.
 
 ## Usage
+
+```toml
+[dependencies]
+pg-query-gate = { git = "https://github.com/XyraSinclair/pg-query-gate" }
+```
+
+The session battery is `SET LOCAL`, so it takes effect only inside an explicit
+transaction: open one (`BEGIN`), run the battery, run the validated query, then
+`COMMIT` or `ROLLBACK`. Outside a transaction every `SET LOCAL` — including the
+read-only flag — is silently discarded, and the per-query protection is gone.
 
 ```rust
 use pg_query_gate::{Policy, session};

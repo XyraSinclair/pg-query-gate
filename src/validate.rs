@@ -1,9 +1,9 @@
 //! The AST gate and the token gate.
 //!
 //! AST-based SQL validation using sqlparser-rs for read-only query execution
-//! paths, plus an independent token-level screen. Ported from a production
-//! public SQL surface that served tens of thousands of untrusted queries;
-//! deployment-specific vocabulary is factored into [`Policy`].
+//! paths, plus an independent token-level screen. Deployment-specific
+//! vocabulary — blocked identifiers, bounded helpers — is factored into
+//! [`Policy`]; the defaults here are the strict, generic floor.
 
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Join,
@@ -925,7 +925,7 @@ fn refused(statement_index: usize, what: &str) -> String {
 }
 
 fn introspection_blocked(identifier: &str) -> String {
-    format!("Postgres introspection blocked. `{}` is not available on this SQL surface.", identifier)
+    format!("`{}` is not available on this SQL surface.", identifier)
 }
 
 fn table_function_error(name: &str) -> String {
@@ -1415,10 +1415,10 @@ mod tests {
     fn test_blocks_catalog_introspection() {
         let err = validate("SELECT * FROM information_schema.columns LIMIT 10")
             .expect_err("information_schema should be blocked");
-        assert!(err.contains("Postgres introspection blocked"));
+        assert!(err.contains("is not available on this SQL surface"));
 
         let err = validate("SELECT * FROM pg_views LIMIT 10").expect_err("pg_views blocked");
-        assert!(err.contains("Postgres introspection blocked"));
+        assert!(err.contains("is not available on this SQL surface"));
     }
 
     #[test]
@@ -1432,7 +1432,7 @@ mod tests {
             "SELECT ts_rewrite(to_tsquery('a'), $$SELECT to_tsquery('a'), to_tsquery('b')$$) LIMIT 1",
         ] {
             let err = validate(sql).expect_err("side-effect helper should be blocked");
-            assert!(err.contains("Postgres introspection blocked"), "unexpected error for {sql}: {err}");
+            assert!(err.contains("is not available on this SQL surface"), "unexpected error for {sql}: {err}");
         }
     }
 

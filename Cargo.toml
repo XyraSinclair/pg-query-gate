@@ -2,8 +2,12 @@
 name = "pg-query-gate"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.82"
 description = "Deny-by-default validation and session hardening for serving untrusted SQL on PostgreSQL."
 license-file = "LICENSE.md"
+repository = "https://github.com/XyraSinclair/pg-query-gate"
+keywords = ["postgres", "sql", "security", "sqlparser", "validation"]
+categories = ["database", "parser-implementations"]
 
 [dependencies]
 sqlparser = { version = "0.52", features = ["visitor"] }
